@@ -98,6 +98,9 @@ func main() {
 	// Parse flags (defaults come from config file, falling back to hardcoded values)
 	kubeconfig := flag.String("kubeconfig", fileCfg.Kubeconfig, "Path to primary kubeconfig file (default: ~/.kube/config)")
 	kubeconfigDir := flag.String("kubeconfig-dir", fileCfg.KubeconfigDirsFlag(), "Comma-separated directories containing additional kubeconfig files")
+	contextName := flag.String("context", "", "Initial kubeconfig context (used for isolated browser tabs)")
+	contextSource := flag.String("context-source", "", "Source kubeconfig file for --context (used for isolated browser tabs)")
+	contextInFile := flag.String("context-in-file", "", "Original context name inside --context-source (used for isolated browser tabs)")
 	namespace := flag.String("namespace", fileCfg.Namespace, "Initial namespace filter (empty = all namespaces)")
 	namespaces := flag.String("namespaces", fileCfg.NamespacesFlag(), "Initial namespace filters as a comma-separated list (e.g. ns1,ns2,ns3). Use this when you can list resources in specific namespaces but cannot list namespaces cluster-wide.")
 	port := flag.Int("port", fileCfg.PortOr(9280), "Server port")
@@ -333,6 +336,8 @@ func main() {
 	cfg := app.AppConfig{
 		Kubeconfig:               resolvedKubeconfig,
 		KubeconfigDirs:           resolvedKubeconfigDirs,
+		ContextTabs:              true,
+		PreferredContext:         k8s.ContextRef{Name: *contextName, SourceFile: *contextSource, InFileName: *contextInFile},
 		Namespace:                resolvedNamespace,
 		Namespaces:               resolvedNamespaces,
 		Port:                     *port,

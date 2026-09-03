@@ -14,6 +14,8 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"net/url"
+	"os"
+	"os/exec"
 	pathpkg "path"
 	"reflect"
 	"runtime"
@@ -97,6 +99,7 @@ type Server struct {
 	newExecutor     func(*rest.Config, *url.URL) (remotecommand.Executor, error)
 	cloudConnectCfg CloudConnectConfig
 	cloudInstall    *cloudInstallManager
+	contextTabs     bool
 	// nsPreferences holds each user's active-namespace pick from the in-app
 	// switcher. Key shape: "<username>\x00<contextName>" when auth is enabled,
 	// "\x00<contextName>" when auth is disabled. Cleared on context switch
@@ -160,7 +163,9 @@ type Server struct {
 	aiDiagnoser *ai.Diagnoser
 	// aiRuns owns investigations as durable server-side jobs (survive panel close
 	// / navigation / refresh). nil exactly when aiDiagnoser is.
-	aiRuns *ai.RunManager
+	aiRuns              *ai.RunManager
+	contextTabsMu       sync.Mutex
+	contextTabProcesses []*exec.Cmd
 }
 
 // Config holds server configuration
@@ -182,6 +187,10 @@ type Config struct {
 	AuthConfig         auth.Config    // Authentication configuration
 	AIHistoryDB        string         // AI run-history SQLite path ("" = memory-only runs)
 	CloudConnect       CloudConnectConfig
+	// ContextTabs enables the standalone local implementation of multi-cluster
+	// browser tabs. Each additional tab is backed by a separate Radar process,
+	// which keeps the existing singleton-based K8s subsystems isolated.
+	ContextTabs bool
 }
 
 // New creates a new server instance
@@ -215,6 +224,7 @@ func New(cfg Config) *Server {
 		currencyManaged:       cfg.OpenCostManaged,
 		authConfig:            cfg.AuthConfig,
 		cloudConnectCfg:       cfg.CloudConnect,
+		contextTabs:           cfg.ContextTabs,
 		topoMemo:              topology.NewMemoizer(5 * time.Second),
 		rbacMemo:              rbac.NewMemoizer(5 * time.Second),
 		capacityIssueMemo:     newCapacityIssueMemo(5 * time.Second),
@@ -783,6 +793,7 @@ func (s *Server) setupAppRoutes(r chi.Router) {
 			// Context routes
 			r.Get("/contexts", s.handleListContexts)
 			r.Post("/contexts/{name}", s.handleSwitchContext)
+			r.Post("/contexts/{name}/tab", s.handleOpenContextTab)
 
 			// Active namespace switcher (k9s :ns equivalent for the
 			// namespace-scoped path; informational filter for cluster-wide users)
@@ -1187,6 +1198,14 @@ func (s *Server) Handler() http.Handler {
 // Stop gracefully stops the server and releases the listening port.
 func (s *Server) Stop() {
 	StopAllLocalTermSessions()
+	s.contextTabsMu.Lock()
+	for _, cmd := range s.contextTabProcesses {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}
+	s.contextTabProcesses = nil
+	s.contextTabsMu.Unlock()
 	if s.aiRuns != nil {
 		s.aiRuns.Shutdown() // cancel investigations so agent children don't outlive us
 	}
@@ -4462,6 +4481,132 @@ func (s *Server) handleSwitchContext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, info)
+}
+
+// handleOpenContextTab starts an isolated local Radar process for a context
+// and returns its URL. Radar's K8s layer intentionally remains singleton-based
+// within one process; process isolation gives browser tabs independent clients,
+// informer caches, SSE streams, and integration state without making a global
+// context switch visible to existing tabs.
+func (s *Server) handleOpenContextTab(w http.ResponseWriter, r *http.Request) {
+	if !s.contextTabsEnabled() {
+		s.writeError(w, http.StatusNotImplemented, "isolated context tabs are available only in standalone local mode")
+		return
+	}
+
+	name, err := url.PathUnescape(chi.URLParam(r, "name"))
+	if err != nil || name == "" {
+		s.writeError(w, http.StatusBadRequest, "invalid context name encoding")
+		return
+	}
+	if name == k8s.GetContextName() {
+		s.writeError(w, http.StatusBadRequest, "context is already open in this tab")
+		return
+	}
+
+	ref := k8s.ContextSourceFor(name)
+	if ref.Empty() {
+		s.writeError(w, http.StatusBadRequest, "context source is unavailable; refresh the context list and try again")
+		return
+	}
+	source := ref.SourceFile
+	if source == "" {
+		source = k8s.GetKubeconfigPath()
+	}
+	if source == "" {
+		s.writeError(w, http.StatusBadRequest, "kubeconfig source is unavailable")
+		return
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "could not allocate a local context-tab port")
+		return
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "could not release the local context-tab port")
+		return
+	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "could not locate the Radar executable")
+		return
+	}
+	args := []string{
+		"--no-browser", "--no-mcp", "--port", strconv.Itoa(port),
+		"--listen-address", "127.0.0.1",
+		"--kubeconfig", source,
+		"--context", ref.Name,
+		"--context-source", ref.SourceFile,
+		"--context-in-file", ref.InFileName,
+	}
+	cmd := exec.Command(executable, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "could not start the isolated context tab")
+		return
+	}
+
+	s.contextTabsMu.Lock()
+	s.contextTabProcesses = append(s.contextTabProcesses, cmd)
+	s.contextTabsMu.Unlock()
+	go func() {
+		_ = cmd.Wait()
+		s.contextTabsMu.Lock()
+		for i, candidate := range s.contextTabProcesses {
+			if candidate == cmd {
+				s.contextTabProcesses = append(s.contextTabProcesses[:i], s.contextTabProcesses[i+1:]...)
+				break
+			}
+		}
+		s.contextTabsMu.Unlock()
+	}()
+
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	if err := waitForLocalListener(r.Context(), address, 5*time.Second); err != nil {
+		if killErr := cmd.Process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+			log.Printf("[context-tab] failed to stop an unready child process: %v", killErr)
+		}
+		log.Printf("[context-tab] child process did not become ready: %v", err)
+		s.writeError(w, http.StatusInternalServerError, "isolated context tab did not become ready")
+		return
+	}
+
+	s.writeJSON(w, map[string]any{
+		"context": name,
+		"port":    port,
+		"url":     "http://127.0.0.1:" + strconv.Itoa(port) + s.basePath,
+	})
+}
+
+func waitForLocalListener(ctx context.Context, address string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+		if err == nil {
+			if err := conn.Close(); err != nil {
+				return fmt.Errorf("close context-tab readiness connection: %w", err)
+			}
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for context-tab listener: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) contextTabsEnabled() bool {
+	return s.contextTabs && !s.authConfig.Enabled() && !k8s.IsInCluster() && !cloud.Mode() && !s.sharedListener()
 }
 
 // Connection status handlers (for graceful startup)
