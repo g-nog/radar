@@ -2164,6 +2164,7 @@ func GetContextSource(name string) (sourceFile, inFileName string, ok bool) {
 		return entry.SourceFile, entry.InFileName, true
 	}
 	path := kubeconfigPath
+	activeName := contextName
 	registryBacked := contextRegistry != nil
 	clientMu.RUnlock()
 	if !registryBacked && path != "" {
@@ -2175,9 +2176,9 @@ func GetContextSource(name string) (sourceFile, inFileName string, ok bool) {
 				return path, name, true
 			}
 		}
-		// Preserve the historical current-context fallback when the source
-		// cannot be reread; startup already validated this binding.
-		if name == contextName {
+		// The active context remains usable when the source cannot be reread
+		// because startup already validated this binding.
+		if name == activeName {
 			return path, name, true
 		}
 	}

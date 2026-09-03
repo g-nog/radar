@@ -6108,7 +6108,7 @@ export interface ContextTabResponse {
 // authenticated and in-cluster deployments report a clear 501 instead.
 export async function openContextTab(name: string): Promise<ContextTabResponse> {
   const response = await apiFetch(
-    `${getApiBase()}/contexts/${encodeURIComponent(name)}/tab`,
+    apiUrl(`/contexts/${encodeURIComponent(name)}/tab`),
     { method: "POST" },
   );
   if (!response.ok) {

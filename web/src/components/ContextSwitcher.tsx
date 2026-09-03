@@ -233,10 +233,10 @@ export const ContextSwitcher = forwardRef<ContextSwitcherHandle, ContextSwitcher
         disabled={contextsLoading}
         searchable={items.length > 1}
         showGroupHeaders={hasMultipleAccounts}
-        onOpenInNewTab={item => {
+        onOpenInNewTab={clusterInfo?.contextTabsEnabled ? item => {
           const parsed = parsedById.get(item.id)
           if (parsed) void handleOpenTab(parsed)
-        }}
+        } : undefined}
         errorSlot={
           switchContext.isError ? (
             <span className="text-xs text-red-400">{switchContext.error?.message}</span>
